@@ -1,0 +1,204 @@
+name: Update Playlist (24h)
+
+on:
+  schedule:
+    # Run every 24 hours at 6:00 UTC (12:00 BST)
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Crawl fmftp.net and build playlist
+        run: |
+          cat > crawl.py << 'PYTHON'
+          import os, re, urllib.parse, urllib.request, json
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from datetime import datetime
+
+          BASE = "https://fmftp.net"
+          TMDB_KEY = "8265bd1679663a7ea12ac168da84d2e8"
+          VIDEO_EXTS = {'.mp4', '.mkv', '.avi', '.mov', '.flv', '.webm', '.m4v', '.ts'}
+
+          def fetch(path):
+              try:
+                  req = urllib.request.Request(BASE + path, headers={'User-Agent': 'SkMovies/1.0'})
+                  with urllib.request.urlopen(req, timeout=20) as r:
+                      return r.read().decode('utf-8', errors='replace')
+              except: return None
+
+          def parse_dir(html):
+              entries = []
+              for m in re.finditer(r'<a href="([^"]+)">[^<]+</a>\s+(\d{2}-\w{3}-\d{4} \d{2}:\d{2})', html):
+                  if m.group(1) != '../':
+                      entries.append((m.group(1), m.group(1).endswith('/'), m.group(2)))
+              return entries
+
+          def get_year(fn):
+              m = re.search(r'\((\d{4})\)', fn) or re.search(r'(?<!\d)(19\d{2}|20\d{2})(?!\d)', fn)
+              return m.group(1) if m else None
+
+          def get_title(fn):
+              t = os.path.splitext(fn)[0]
+              t = re.sub(r'[._]', ' ', t)
+              t = re.sub(r'\(\d{4}\)', '', t)
+              t = re.sub(r'\b(720p|1080p|480p|2160p|4K|WEBRip|BluRay|HDRip|DVDRip|WEB-DL|x264|x265|AAC|DD5\.1|HEVC|CYBER|iTA-ENG)\b', '', t, flags=re.IGNORECASE)
+              t = re.sub(r'\[[^\]]+\]', '', t)
+              t = re.sub(r'\s+', ' ', t).strip()
+              return t if t else fn
+
+          def get_group(path):
+              parts = path.split('/')
+              cats = {'bollywood':'Movies | Hindi','hollywood':'Movies | English',
+                      'hindidub':'Movies | Hindi Dubbed','indianbangla':'Movies | Bangla',
+                      'animation':'Anime | Latest','korean':'Movies | South',
+                      'tamil':'Movies | South','thai':'Movies | South',
+                      'turkish':'Series | Turkish','pakisthani':'Movies | Pakistani',
+                      'horror':'Movies | Horror','foreigner%20movie':'Movies | Foreign',
+                      'new':'Movies | Latest','fm':'Movies | FM Collection'}
+              if 'tvseries' in parts:
+                  try:
+                      idx = parts.index('tvseries')
+                      if idx + 1 < len(parts) - 1:
+                          return f"Series | {urllib.parse.unquote(parts[idx+1])}"
+                  except: pass
+                  return "Series | Latest"
+              for p in parts:
+                  d = urllib.parse.unquote(p).lower()
+                  if d in cats: return cats[d]
+              return "Movies | Latest"
+
+          def process_dir(path, depth=0):
+              if depth > 7: return []
+              html = fetch(path)
+              if not html: return []
+              results = []
+              subdirs = []
+              for name, is_dir, date in parse_dir(html):
+                  full = (path + name) if path.endswith('/') else (path + '/' + name)
+                  enc = full.replace(' ', '%20')
+                  if is_dir:
+                      subdirs.append((enc, depth + 1))
+                  else:
+                      ext = os.path.splitext(name)[1].lower()
+                      if ext in VIDEO_EXTS:
+                          fn = urllib.parse.unquote(name)
+                          title = get_title(fn)
+                          year = get_year(fn)
+                          group = get_group(path)
+                          try: sd = datetime.strptime(date, "%d-%b-%Y %H:%M")
+                          except: sd = datetime.min
+                          results.append({'title':title,'url':BASE+enc,'group':group,'year':year,'sort_date':sd})
+              if subdirs:
+                  with ThreadPoolExecutor(max_workers=10) as ex:
+                      futures = [ex.submit(process_dir, sd[0], sd[1]) for sd in subdirs]
+                      for f in as_completed(futures):
+                          results.extend(f.result())
+              return results
+
+          # Load existing poster map
+          poster_map = {}
+          if os.path.exists('poster_map.json'):
+              with open('poster_map.json') as f:
+                  poster_map = json.load(f)
+          print(f"Loaded {len(poster_map)} existing posters")
+
+          # Crawl
+          all_items = []
+          for start in ["/data/disk-1/movies/", "/data/disk-1/tvseries/"]:
+              print(f"Crawling: {start}")
+              all_items.extend(process_dir(start))
+          print(f"Total items: {len(all_items)}")
+
+          # Sort newest first
+          all_items.sort(key=lambda x: x['sort_date'], reverse=True)
+
+          # Assign posters
+          with_poster = 0
+          for item in all_items:
+              clean = re.sub(r'\s*\(\d{4}\)\s*$', '', item['title']).strip().lower()
+              if clean in poster_map:
+                  item['poster'] = poster_map[clean]
+                  with_poster += 1
+              else:
+                  item['poster'] = ''
+          print(f"Posters: {with_poster}/{len(all_items)}")
+
+          # Write M3U
+          with open('movies.m3u', 'w', encoding='utf-8') as f:
+              f.write("#EXTM3U\n")
+              for item in all_items:
+                  t = item['title']
+                  if item['year']: t += f" ({item['year']})"
+                  extinf = "#EXTINF:-1"
+                  if item['poster']: extinf += f' tvg-logo="{item["poster"]}"'
+                  extinf += f' group-title="{item["group"]}"'
+                  extinf += f",{t}\n"
+                  f.write(extinf)
+                  f.write(f"{item['url']}\n")
+          print(f"Written: {os.path.getsize('movies.m3u'):,} bytes")
+
+          # Fetch new posters from TMDB (limited to 200 per run for rate limiting)
+          need_poster = [i for i in all_items if not i['poster']][:200]
+          print(f"Fetching {len(need_poster)} new posters from TMDB...")
+          fetched = 0
+          for item in need_poster:
+              try:
+                  title = re.sub(r'\s*\(\d{4}\)\s*$', '', item['title']).strip()
+                  params = {'api_key': TMDB_KEY, 'query': title}
+                  if item['year']: params['year'] = item['year']
+                  url = f"https://api.themoviedb.org/3/search/movie?" + urllib.parse.urlencode(params)
+                  req = urllib.request.Request(url, headers={'User-Agent': 'SkMovies/1.0'})
+                  with urllib.request.urlopen(req, timeout=10) as r:
+                      data = json.loads(r.read())
+                  if data.get('results'):
+                      for result in data['results']:
+                          if result.get('poster_path'):
+                              item['poster'] = f"https://image.tmdb.org/t/p/w500{result['poster_path']}"
+                              clean = re.sub(r'\s*\(\d{4}\)\s*$', '', item['title']).strip().lower()
+                              poster_map[clean] = item['poster']
+                              fetched += 1
+                              break
+              except: pass
+          print(f"Fetched {fetched} new posters")
+
+          # Save updated poster map
+          with open('poster_map.json', 'w') as f:
+              json.dump(poster_map, f)
+          print(f"Poster map: {len(poster_map)} entries")
+
+          # Re-write M3U with new posters
+          with open('movies.m3u', 'w', encoding='utf-8') as f:
+              f.write("#EXTM3U\n")
+              for item in all_items:
+                  t = item['title']
+                  if item['year']: t += f" ({item['year']})"
+                  extinf = "#EXTINF:-1"
+                  if item['poster']: extinf += f' tvg-logo="{item["poster"]}"'
+                  extinf += f' group-title="{item["group"]}"'
+                  extinf += f",{t}\n"
+                  f.write(extinf)
+                  f.write(f"{item['url']}\n")
+          print(f"Final: {os.path.getsize('movies.m3u'):,} bytes")
+          PYTHON
+          python3 crawl.py
+
+      - name: Commit changes
+        run: |
+          git config user.name "Auto Update Bot"
+          git config user.email "bot@skmovies.app"
+          git add movies.m3u poster_map.json
+          git diff --staged --quiet || git commit -m "Auto-update: $(date -u '+%Y-%m-%d %H:%M') playlist refresh"
+          git push
