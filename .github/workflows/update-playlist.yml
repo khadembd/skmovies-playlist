@@ -151,7 +151,7 @@ jobs:
           print(f"Written: {os.path.getsize('movies.m3u'):,} bytes")
 
           # Fetch new posters from TMDB (limited to 200 per run for rate limiting)
-          need_poster = [i for i in all_items if not i['poster']][:200]
+          need_poster = [i for i in all_items if not i["poster"]][:5000]
           print(f"Fetching {len(need_poster)} new posters from TMDB...")
           fetched = 0
           for item in need_poster:
